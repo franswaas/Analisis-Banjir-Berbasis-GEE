@@ -1,0 +1,196 @@
+// APLIKASI SAR: DETEKSI BANJIR PERKOTAAN 
+
+Map.centerObject(roi, 12);
+
+// ------------------------------------------------------------------
+// 2. Fungsi Persiapan Data (Dengan Pengecekan)
+// ------------------------------------------------------------------
+function prepS1(dateRange, label) {
+  var col = ee.ImageCollection('COPERNICUS/S1_GRD')
+      .filterBounds(roi)
+      .filterDate(dateRange) 
+      .filter(ee.Filter.eq('instrumentMode', 'IW'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')) 
+      .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+      
+
+  var count = col.size();
+  print('Jumlah Citra ditemukan untuk ' + label + ':', count);
+  
+  // Ambil rata-rata & clip
+  return col.mean().clip(roi).select('VV'); 
+}
+
+// 2. FUNGSI PERSIAPAN DATA OPTIK SENTINEL-2 RGB (Baru ditambahkan)
+// ------------------------------------------------------------------
+
+// Fungsi Cloud Mask untuk Sentinel-2
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  // Kembalikan citra yang dimask, diskalakan (dibagi 10000), dan dipilih band RGB
+  return image.updateMask(mask).divide(10000)
+      .select('B4', 'B3', 'B2'); // B4=Red, B3=Green, B2=Blue
+}
+
+function prepS2_RGB(dateRange, label) {
+  var col = ee.ImageCollection('COPERNICUS/S2_SR')
+      .filterBounds(roi)
+      .filterDate(dateRange)
+      // Filter Awan Metadata (maksimum 10% awan)
+      .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 10);
+      
+  var count = col.size();
+  print('Jumlah Citra S2 ditemukan untuk ' + label + ':', count);
+
+  // Terapkan Cloud Mask dan ambil median komposit
+  var s2_masked = col.map(maskS2clouds);
+  return s2_masked.median().clip(roi);
+}
+
+// ------------------------------------------------------------------
+// 3. Tentukan Waktu 
+// ------------------------------------------------------------------
+
+
+// BASELINE (Januari 2025 - Full Bulan)
+var dateBaseline = ee.DateRange('2025-01-01', '2025-01-31'); 
+var imageBaseline = prepS1(dateBaseline, 'Baseline');
+
+// EVENT (November 2025)
+var dateFlood = ee.DateRange('2025-11-25', '2025-11-30'); 
+var imageFlood = prepS1(dateFlood, 'Event Banjir');
+
+var imageBaselineRGB = prepS2_RGB(dateBaseline, 'Baseline S2 RGB');
+
+// ------------------------------------------------------------------
+// 4. Visualisasi Citra VV
+// ------------------------------------------------------------------
+var visParamsVV = {min: -20, max: 0}; 
+
+Map.addLayer(imageBaseline, visParamsVV, 'VV Baseline (Kering)', 0);
+Map.addLayer(imageFlood, visParamsVV, 'VV Event (Banjir)', 1);
+
+// Visualisasi Sentinel-2 (RGB) - True Color
+var visParamsRGB = {
+    min: 0.05,
+    max: 0.35,
+    bands: ['B4', 'B3', 'B2'],
+    gamma: 1.5
+};
+Map.addLayer(imageBaselineRGB, visParamsRGB, 'Sentinel-2 RGB Baseline (Referensi Area)', true, 1);
+
+// ------------------------------------------------------------------
+// 5. Komposit RGB Deteksi Banjir
+// ------------------------------------------------------------------
+var floodComposite = ee.Image.cat(
+  imageBaseline, // R: Terang
+  imageFlood,    // G: Gelap (Jika banjir)
+  imageBaseline  // B: Terang
+);
+
+Map.addLayer(floodComposite, {min: -20, max: 0}, 'RGB Banjir (Magenta = Tergenang)');
+
+// ==================================================================
+// 6. THRESHOLD & MASKING
+// ==================================================================
+
+// Smoothing untuk mengurangi speckle
+var smoothingRadius = 50; 
+var imgBaseSmooth = imageBaseline.focal_mean(smoothingRadius, 'circle', 'meters');
+var imgFloodSmooth = imageFlood.focal_mean(smoothingRadius, 'circle', 'meters');
+
+// Threshold Daratan (Bukan laut/sungai permanen)
+var maskLand = imgBaseSmooth.gt(-15);
+
+
+var maskSignificantDrop = imgBaseSmooth.subtract(imgFloodSmooth).gt(4);
+
+// Gabungkan Mask
+var maskFlood = maskLand.and(maskSignificantDrop);
+
+Map.addLayer(maskFlood.selfMask(), {palette: '00FFFF'}, 'Masking Area Banjir (Cyan)');
+// ==================================================================
+// 7. STATISTIK LUASAN GENANGAN 
+// ==================================================================
+var pixelArea = ee.Image.pixelArea();
+var floodAreaImage = pixelArea.updateMask(maskFlood);
+
+// Kita hitung statistik
+var floodStats = floodAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+// Mengambil nilai area
+var areaValue = floodStats.get('area');
+
+
+areaValue.evaluate(function(result) {
+  if (result === null || result === undefined) {
+    print('--- STATISTIK BANJIR ---');
+    print('Tidak ada area banjir terdeteksi atau citra kosong.');
+  } else {
+    var totalAreaHectares = ee.Number(result).divide(10000);
+    print('--- STATISTIK BANJIR ---');
+    print('Estimasi Luas Genangan (Ha):', totalAreaHectares);
+  }
+});
+
+
+// ==================================================================
+// 8. HISTOGRAM PERBANDINGAN
+// ==================================================================
+
+var baseRenamed = imageBaseline.rename('VV_Baseline');
+var floodRenamed = imageFlood.rename('VV_Event');
+
+var histogramImage = ee.Image.cat(baseRenamed, floodRenamed);
+
+// Cek apakah image memiliki band sebelum membuat chart
+var chart = ui.Chart.image.histogram({
+  image: histogramImage,
+  region: roi,
+  scale: 30,
+  maxPixels: 1e9
+}).setOptions({
+  title: 'Pergeseran Nilai Backscatter VV',
+  hAxis: {title: 'Backscatter (dB)'},
+  vAxis: {title: 'Jumlah Piksel'},
+  colors: ['gray', 'blue'] 
+});
+
+print('--- GRAFIK PERUBAHAN SINYAL ---');
+print(chart);
+
+// 9. EKSPOR DATA RGB & MASK BANJIR (Perubahan: RGB menggunakan Baseline)
+// ==================================================================
+
+// A. Perintah ekspor untuk citra Sentinel-2 RGB (Baseline)
+Export.image.toDrive({
+    image: imageBaselineRGB.select('B4', 'B3', 'B2'), // <--- VARIABEL DIPERBAIKI
+    description: 'S2_RGB_Baseline_for_ArcGIS',
+    folder: 'GEE_Exports_ArcGIS', 
+    fileNamePrefix: 'S2_RGB_Baseline',
+    scale: 10, 
+    region: roi.getInfo(),
+    maxPixels: 1e13
+});
+
+// B. Perintah ekspor untuk Masking Area Banjir (MaskFlood)
+Export.image.toDrive({
+    image: maskFlood.rename('Flood_Mask').byte(), 
+    description: 'Flood_Mask_for_ArcGIS',
+    folder: 'GEE_Exports_ArcGIS', 
+    fileNamePrefix: 'Flood_Mask',
+    scale: 10, 
+    region: roi.getInfo(),
+    maxPixels: 1e13
+});
+
+print('✅ Dua Perintah Ekspor sudah disiapkan (RGB Baseline dan Flood Mask). Jalankan di tab "Tasks".');
